@@ -223,7 +223,35 @@ exports('HandleConnection', function(source, identifier, deferrals)
     return CancelEvent()
   end
 
-  -- Banning Handled by TxAdmin
+  local ban = exports['pulsar-core']:PunishmentCheckBan("identifier", identifier)
+
+  if not ban then
+    local connectingTokens = {}
+    do
+      local i = 0
+      while true do
+        local t = GetPlayerToken(source, i)
+        if not t then break end
+        table.insert(connectingTokens, t)
+        i = i + 1
+      end
+    end
+    ban = exports['pulsar-core']:PunishmentCheckBanTokens(connectingTokens)
+  end
+
+  if ban then
+    local reason = ban.reason or "Banned"
+    if ban.expires == -1 then
+      deferrals.done(string.format("You're Permanently Banned, Appeal in Discord\n\nReason: %s\nID: %s", reason, ban._id))
+    else
+      deferrals.done(string.format("You're Banned, Appeal in Discord\n\nReason: %s\nExpires: %s\nID: %s",
+        reason,
+        os.date("%%Y-%%m-%%d at %%I:%%M:%%S %%p", ban.expires),
+        ban._id
+      ))
+    end
+    return CancelEvent()
+  end
 
   local time = GetGameTimer()
   local joinedAt = GetGameTimer()

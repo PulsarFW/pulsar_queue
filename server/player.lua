@@ -51,6 +51,17 @@ function PlayerClass(identifier, player, deferrals, steamName)
 
 	local mPrio = math.min(Config.MaxPrio, prio)
 
+	local _tokens = {}
+	do
+		local i = 0
+		while true do
+			local t = GetPlayerToken(player, i)
+			if not t then break end
+			table.insert(_tokens, t)
+			i = i + 1
+		end
+	end
+
 	local _data = {
 		Source = player,
 		Groups = groups,
@@ -61,6 +72,7 @@ function PlayerClass(identifier, player, deferrals, steamName)
 		Avatar = "",
 		Identifier = identifier,
 		SteamName = steamName,
+		Tokens = _tokens,
 		Priority = mPrio,
 		Message = msg,
 		TimeBoost = 0,
