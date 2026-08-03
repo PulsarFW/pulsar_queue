@@ -1,79 +1,85 @@
-function PlayerClass(identifier, player, deferrals, steamName)
-	local playerName = steamName or GetPlayerName(player) or "Unknown"
+States = {
+	QUEUED = 1,
+	JOINING = 2,
+	JOINED = 3,
+	DISCONNECTED = 4,
+}
+
+function PlayerClass(identifier, player, deferrals)
+	local member = FetchDatabaseUser(identifier, player)
+	if not member or member == "" or member == -1 then
+		return nil
+	end
+
+	if GetConvar("danger_everyone_is_admin", "") == "1" then -- everyone is management when this convar is 1
+		local hasManagement = false
+		for _, group in ipairs(member.groups) do
+			if group == "Management" then
+				hasManagement = true
+				break
+			end
+		end
+		if not hasManagement then
+			table.insert(member.groups, "Management")
+		end
+	end
 
 	local prio = 0
 	local msg = ""
 
-	if exports['pulsar-queue']:HasCrashPriority(identifier) then
-		msg = msg .. "\n💥 Crash Priority | +50"
-		prio = prio + 50
+	if member.priority then
+		local prioBoosts = tonumber(member.priority)
+		if prioBoosts and prioBoosts > 0 then
+			msg = "\n🎉 Extra Priority Boosts | +" .. prioBoosts
+			prio = prio + prioBoosts
+		end
 	end
 
-	local tempPrio = exports['pulsar-queue']:HasTempPriority(identifier)
+	if QUEUE.Dropped:Get(identifier) then
+		msg = msg .. "\n💥 Crash Priority | +1000"
+		prio = prio + 1000
+	end
+
+	local tempPrio = QUEUE.TempPriority:Get(identifier)
 	if tempPrio then
 		msg = msg .. string.format("\n🦖 Temporary Priority | +%s", tempPrio.Priority)
 		prio = prio + tempPrio.Priority
 	end
 
-	-- Default group for all players for now
-	local groups = { "whitelisted" }
+	for _, group in ipairs(member.groups) do
+		if Config.Groups[group] and Config.Groups[group].Queue and Config.Groups[group].Queue.Priority > 0 then
+			prio = prio + tonumber(Config.Groups[group].Queue.Priority)
 
-	-- Player Permissions
-	if GetConvar("danger_everyone_is_admin", "") == "1" then -- Everyone is management when this convar is 1
-		table.insert(groups, "management")
-	else
-		local permissions = {
-			["queue.management"] = "management",
-			["queue.dev"] = "dev",
-			["queue.admin"] = "admin",
-			["queue.operations"] = "operations"
-		}
-
-		for permission, group in pairs(permissions) do
-			if IsPlayerAceAllowed(player, permission) then
-				table.insert(groups, group)
-			end
+			msg = msg
+				.. "\n"
+				.. string.format(
+					"%s | +%s",
+					Config.Groups[group].Queue.Message or Config.Groups[group].Name,
+					Config.Groups[group].Queue.Priority
+				)
 		end
 	end
 
-	for _, group in ipairs(groups) do
-		local groupData = exports['pulsar-core']:ConfigGetGroupById(group)
-		if groupData and groupData.Queue and groupData.Queue.Priority > 0 then
-			prio = prio + tonumber(groupData.Queue.Priority)
-
-			msg = msg .. "\n" .. string.format(
-				"%s | +%s",
-				groupData.Queue.Message or groupData.Name,
-				groupData.Queue.Priority
-			)
-		end
+	if member.priority > 0 then
+		msg = "\n🌟 Base Priority | +" .. member.priority .. " 🌟" .. msg
 	end
 
-	local mPrio = math.min(Config.MaxPrio, prio)
-
-	local _tokens = {}
-	do
-		local i = 0
-		while true do
-			local t = GetPlayerToken(player, i)
-			if not t then break end
-			table.insert(_tokens, t)
-			i = i + 1
-		end
+	while prio == nil do
+		Wait(10)
 	end
 
 	local _data = {
 		Source = player,
-		Groups = groups,
-		Name = playerName,
-		Discord = "",
-		Mention = "",
-		AccountID = steamName or identifier,
-		Avatar = "",
+		State = States.QUEUED,
+		ID = member._id,
+		Groups = member.groups,
+		Name = member.name,
+		AccountID = member.account,
+		Avatar = member.avatar,
+		Tokens = member.tokens,
 		Identifier = identifier,
-		SteamName = steamName,
-		Tokens = _tokens,
-		Priority = mPrio,
+		Verified = member.verified,
+		Priority = prio,
 		Message = msg,
 		TimeBoost = 0,
 		Deferrals = deferrals,
@@ -85,8 +91,8 @@ function PlayerClass(identifier, player, deferrals, steamName)
 			Second = 0,
 
 			Tick = function(self, plyr)
-				if self.Second >= 59 then
-					if self.Minute >= 59 then
+				if self.Second == 59 then
+					if self.Minute == 59 then
 						self.Second = 0
 						self.Minute = 0
 						self.Hour = self.Hour + 1
@@ -94,29 +100,67 @@ function PlayerClass(identifier, player, deferrals, steamName)
 						self.Second = 0
 						self.Minute = self.Minute + 1
 					end
+
+					if plyr.TimeBoost < Config.Settings.MaxTimeBoost then
+						plyr.TimeBoost = plyr.TimeBoost + 1
+						plyr.Priority = plyr.Priority + 1
+					end
 				else
-					self.Second = self.Second + 5
+					self.Second = self.Second + 1
 				end
 			end,
 			Output = function(self)
-				if self.Hour >= 1 then
-					return string.format("%d %s %d %s", self.Hour, self.Hour > 1 and "Hours" or "Hour", self.Minute,
-						self.Minute == 1 and "Minute" or "Minutes")
-				else
-					return string.format("%d %s", self.Minute > 1 and self.Minute or 1,
-						self.Minute <= 1 and "Minute" or "Minutes")
-				end
+				return string.format("%02d:%02d:%02d", self.Hour, self.Minute, self.Second)
 			end,
 		},
 
 		IsWhitelisted = function(self)
-			if APIWorking and WebAPI then
-				local whitelistData = WebAPI:GetWhitelistStatus(identifier)
-				if whitelistData then
-					return whitelistData.whitelisted
+			if _tempWhitelist[self.ID] then
+				return true
+			end
+
+			-- print(type(plsr.Convar.ACCESS_ROLE.value))
+			if plsr.Convar.ACCESS_ROLE.value == "0" then
+				return true
+			end
+
+			if #member.groups > 0 then
+				local accessRole = plsr.Convar.ACCESS_ROLE.value or "Whitelisted"
+				for _, group in ipairs(member.groups) do
+					if
+						Config.Groups[group]
+						and (
+							(Config.Groups[group].Abv == accessRole)
+							or (type(Config.Groups[group].Permission) == "table" and Config.Groups[group].Permission.Level >= 10)
+							or _tempWhitelistGroup[Config.Groups[group].Abv]
+						)
+					then
+						return true
+					end
 				end
 			end
-			return true
+
+			return false
+		end,
+
+		IsBanned = function(self)
+			return (
+				plsr.Punishment:CheckBan("account", self.AccountID)
+				or plsr.Punishment:CheckBan("identifier", self.Identifier)
+			)
+		end,
+
+		IsVerified = function(self)
+			return self.Verified
+		end,
+
+		IsTokenBanned = function(self)
+			local tkns = {}
+			for i = 0, GetNumPlayerTokens(self.Source) - 1 do
+				table.insert(tkns, GetPlayerToken(self.Source, i))
+			end
+
+			return plsr.Punishment:CheckTokenBan(tkns)
 		end,
 
 		IsInGracePeriod = function(self)
@@ -126,25 +170,88 @@ function PlayerClass(identifier, player, deferrals, steamName)
 				return os.time() <= self.Grace + (60 * Config.Settings.Grace)
 			end
 		end,
-
-		GetPriority = function(self)
-			return self.Priority
-		end
 	}
 
 	return _data
 end
 
-function GetPlayerTokens(account)
+local _usersTableReady = false
+local function ensureUsersTable(callback)
+	if _usersTableReady then
+		if callback then
+			callback()
+		end
+		return
+	end
+	plsr.Database:Query(
+		"CREATE TABLE IF NOT EXISTS `users` (`id` BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY, `identifier` VARCHAR(191) NOT NULL, `account` BIGINT UNSIGNED NOT NULL, `name` VARCHAR(191) NOT NULL, `groups` JSON NOT NULL, `data` JSON NOT NULL, UNIQUE INDEX `idx_identifier` (`identifier`), UNIQUE INDEX `idx_account` (`account`))",
+		nil,
+		function()
+			_usersTableReady = true
+			if callback then
+				callback()
+			end
+		end
+	)
+end
+
+function FetchDatabaseUser(identifier, player)
 	local p = promise.new()
 
-	exports.oxmysql:execute('SELECT tokens FROM tokens WHERE account = ?', { account }, function(results)
-		if results and #results > 0 and results[1].tokens then
-			local tokens = json.decode(results[1].tokens)
-			p:resolve(tokens)
-		else
-			p:resolve(nil)
-		end
+	ensureUsersTable(function()
+		plsr.Database:Single("SELECT `id`, `account`, `name`, `groups`, `data` FROM `users` WHERE `identifier` = ?", { identifier }, function(success, row)
+			if success and row ~= nil then
+				local ok, existing = pcall(json.decode, row.data)
+				if ok and type(existing) == "table" then
+					existing._id = row.id
+					existing.identifier = identifier
+					existing.account = row.account
+					existing.name = row.name
+
+					local groupsOk, groups = pcall(json.decode, row.groups)
+					existing.groups = (groupsOk and type(groups) == "table") and groups or {}
+
+					--[[
+						Added this check to update player names if they've changed
+						Also checking to see if player name was nil and if so
+						Update it as well, but even on player join, it should
+						prevent them from joining with an empty name
+					]]
+					--
+					local currentName = GetPlayerName(player)
+					if row.name == nil or row.name ~= currentName then
+						existing.name = currentName
+						plsr.Database:Update("UPDATE `users` SET `name` = ? WHERE `id` = ?", { currentName, row.id }, function()
+							p:resolve(existing)
+						end)
+					else
+						p:resolve(existing)
+					end
+					return
+				end
+			end
+
+			local account = plsr.Sequence:Get("Account")
+			local name = GetPlayerName(player)
+			local groups = { "Whitelisted" }
+			local doc = {
+				name = name,
+				account = account,
+				identifier = identifier,
+				verified = true,
+				joined = os.time() * 1000,
+				priority = 0,
+			}
+			plsr.Database:Insert(
+				"INSERT INTO `users` (`identifier`, `account`, `name`, `groups`, `data`) VALUES (?, ?, ?, ?, ?)",
+				{ identifier, account, name, json.encode(groups), json.encode(doc) },
+				function(insertSuccess, newId)
+					doc._id = newId
+					doc.groups = groups
+					p:resolve(doc)
+				end
+			)
+		end)
 	end)
 
 	return Citizen.Await(p)

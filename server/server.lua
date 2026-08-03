@@ -1,8 +1,9 @@
-Convar = {}
-
 local queueEnabled, queueActive, queueClosed = true, false, false
 local resourceName = GetCurrentResourceName()
 local MAX_PLAYERS = tonumber(GetConvar("sv_maxclients", "32"))
+
+_tempWhitelist = {}
+_tempWhitelistGroup = {}
 
 GlobalState["MaxPlayers"] = MAX_PLAYERS
 
@@ -12,608 +13,776 @@ local privPlayerJoining = false
 local _dbReadyTime = 0
 local _dbReady = false
 
-local APIWorking = false
+local Data = {
+	Total = 0,
+	Session = {
+		Count = 0,
+		Players = {},
+	},
+	Dropped = {},
+	Queue = {},
+	TempPriority = {},
+}
 
-AddEventHandler('onResourceStart', function(resource)
-  if resource == GetCurrentResourceName() then
-    Wait(1000)
-    exports['pulsar-core']:VersionCheck('PulsarFW/pulsar-queue')
-    Config.Server = exports['pulsar-core']:ConfigGetServer()
-    Config.Groups = exports['pulsar-core']:ConfigGetGroups()
-    queueActive = true
-    exports["pulsar-chat"]:RegisterAdminCommand("queue", function(source, args, rawCommand)
-      local message = "Queue List"
+QUEUE = {}
 
-      for k, v in ipairs(QUEUE_PLAYERS_SORTED) do
-        local pData = QUEUE_PLAYERS_DATA[v]
-        if pData then
-          message = message .. string.format("<br>#%d - %s (%s)", k, pData.Name, v)
-        end
-      end
-      exports["pulsar-chat"]:SendSystemSingle(source, message)
-    end, {
-      help = "Print the Queue",
-    })
+QUEUE.Queue = {
+	Get = function(self, identifier)
+		for k, v in ipairs(Data.Queue) do
+			if v.Identifier == identifier then
+				return k, v
+			end
+		end
 
-    exports["pulsar-chat"]:RegisterAdminCommand("yeetqueue", function(source, args, rawCommand)
-      for k, v in pairs(QUEUE_PLAYERS) do
-        if QUEUE_PLAYERS_DATA[k] then
-          QUEUE_PLAYERS_DATA[k].Deferrals.done("Deleted")
-        end
+		return nil
+	end,
+	Add = function(self, player)
+		for k, v in ipairs(Data.Queue) do
+			if player.Identifier == v.Identifier then
+				if v:IsInGracePeriod() then
+					v.Deferrals = player.Deferrals
+					v.State = States.QUEUED
+					v.Source = player.Source
+					v.Groups = player.Groups
+					v.Name = player.Name
+					v.ID = player.ID
+					v.AccountID = player.AccountID
+					v.Tokens = player.Tokens
+					v.Avatar = player.Avatar
+					v.Priority = player.Priority
+					v.TimeBoost = player.TimeBoost
+					v.Message = player.Message
+					v.ReturnedFromSave = true
+				else
+					QUEUE.Queue:Remove(k)
+				end
+				return
+			end
+		end
 
-        exports['pulsar-queue']:Pop(k, true)
-      end
-      exports["pulsar-chat"]:SendSystemSingle(source, "Done")
-    end, {
-      help = "Yeet the Queue [DANGER!]",
-    })
+		if player.Priority > 0 then
+			for k, v in ipairs(Data.Queue) do
+				if player.Priority > v.Priority then
+					table.insert(Data.Queue, k, player)
+					Log(
+						string.format(
+							Config.Strings.PrioAdd,
+							player.Name,
+							player.Identifier,
+							k,
+							#Data.Queue,
+							player.Priority
+						)
+					)
+					return
+				end
+			end
+		end
 
-    exports["pulsar-chat"]:RegisterAdminCommand("maxplayers", function(source, args, rawCommand)
-      local max = tonumber(args[1])
-      if max and max > 0 and max < 500 then
-        MAX_PLAYERS = max
-        GlobalState["MaxPlayers"] = MAX_PLAYERS
-        SetConvarServerInfo("sv_maxclients", MAX_PLAYERS)
-        exports["pulsar-chat"]:SendSystemSingle(source, "Max Players Set")
-      end
-    end, {
-      params = {
-        {
-          name = "Max Player Count",
-          help = "Number",
-        },
-      },
-      help = "Set Max Players",
-    })
+		table.insert(Data.Queue, player)
+		Log(
+			string.format(
+				Config.Strings.Add,
+				player.Name,
+				player.AccountID,
+				player.Identifier,
+				#Data.Queue,
+				#Data.Queue,
+				GetNumPlayerIndices(),
+				player.Priority
+			)
+		)
+	end,
+	Remove = function(self, position)
+		table.remove(Data.Queue, position)
+	end,
+	Join = function(self, count)
+		local joined = 0
+		for i = 1, #Data.Queue, 1 do
+			if joined == count then
+				break
+			end
+			if Data.Queue[i] ~= nil and Data.Queue[i].State == States.QUEUED then
+				if GetPlayerEndpoint(Data.Queue[i].Source) then
+					Data.Total = Data.Total + 1
+					Data.Queue[i].Deferrals.update(Config.Strings.Joining)
+					Data.Queue[i].State = States.JOINING
+					Data.Queue[i].Deferrals.handover({
+						name = Data.Queue[i].Name,
+						priority = Data.Queue[i].Priority,
+						priorityMessage = Data.Queue[i].Message,
+					})
+					Data.Queue[i].Deferrals.done()
+					Log(
+						string.format(
+							Config.Strings.Joined,
+							Data.Queue[i].Name,
+							Data.Queue[i].AccountID,
+							Data.Queue[i].Identifier
+						)
+					)
+					joined = joined + 1
+				else
+					Data.Queue[i].State = States.DISCONNECTED
+					Data.Queue[i].Grace = os.time()
+					Log(
+						string.format(
+							Config.Strings.Disconnected,
+							Data.Queue[i].Name,
+							Data.Queue[i].AccountID,
+							Data.Queue[i].Identifier
+						)
+					)
+				end
+			end
+		end
+		playerJoining = false
+	end,
+	Drop = function(self, priv)
+		local dropping = nil
+		for k, v in pairs(Data.Session.Players) do
+			if v ~= nil and (dropping == nil or v.Priority < dropping.Priority) then
+				dropping = v
+			end
+		end
 
-    exports["pulsar-chat"]:RegisterStaffCommand("tempprio", function(source, args, rawCommand)
-      local ident = args[1]
-      local prio = tonumber(args[2])
+		DropPlayer(dropping.Source, Config.Strings.Dropped)
+		priv.Deferrals.done()
+	end,
+}
 
-      if ident and prio and prio > 0 and prio <= 200 then
-        exports['pulsar-queue']:AddTempPriority(ident, prio)
-        exports["pulsar-chat"]:SendSystemSingle(source, "Priority Added")
-      else
-        exports["pulsar-chat"]:SendSystemSingle(source, "Error")
-      end
-    end, {
-      params = {
-        {
-          name = "Player Identifier",
-          help = "Player's FiveM Identifier (License)",
-        },
-        {
-          name = "Priority",
-          help = "Number (1-200)",
-        },
-      },
-      help = "Add Temporary Priority",
-    })
-
-    _dbReadyTime = GetGameTimer()
-    _dbReady = true
-  end
-end)
-
-QUEUE_PLAYERS_DATA = {}
-
-QUEUE_PLAYERS = {}
-QUEUE_PLAYERS_SORTED = {}
-
-CURRENT_CONNECTORS = {}
-CURRENT_CONNECTORS_COUNT = 0
-
-QUEUE_CRASH_PRIORITY = {}
-QUEUE_TEMP_PRIORITY = {}
-
-CONNECTING_PLAYERS_DATA = {}
-
-QUEUE_PLAYER_HISTORY = {} -- For remembering queue positions
-
-local function SortQueue()
-  local sorted = getKeysSortedByValue(QUEUE_PLAYERS, function(a, b)
-    if a.priority ~= b.priority then
-      return a.priority > b.priority
-    end
-
-    return a.joinedAt < b.joinedAt
-  end)
-
-  QUEUE_PLAYERS_SORTED = sorted
+function deepcopy(orig)
+	local orig_type = type(orig)
+	local copy
+	if orig_type == "table" then
+		copy = {}
+		for orig_key, orig_value in next, orig, nil do
+			copy[deepcopy(orig_key)] = deepcopy(orig_value)
+		end
+		setmetatable(copy, deepcopy(getmetatable(orig)))
+	else -- number, string, boolean, etc
+		copy = orig
+	end
+	return copy
 end
 
-local function PopFromQueue(identifier, disconnect)
-  if QUEUE_PLAYERS[identifier] then
-    QUEUE_PLAYERS[identifier] = nil
-    local ply = QUEUE_PLAYERS_DATA[identifier]
-    if ply and disconnect then
-      Log(
-        string.format(
-          Config.Strings.Disconnected,
-          ply.Name,
-          ply.SteamName or ply.AccountID,
-          ply.Identifier
-        )
-      )
-    end
+QUEUE.Dropped = {
+	Get = function(self, identifier)
+		for k, v in ipairs(Data.Dropped) do
+			if v.Identifier == identifier and os.time() < v.Grace then
+				return k
+			end
+		end
 
-    QUEUE_PLAYERS_DATA[identifier] = nil
-    SortQueue()
-  end
+		return nil
+	end,
+	Add = function(self, source, message)
+		Data.Total = Data.Total - 1
+		for _, v in ipairs(Config.ExcludeDrop) do
+			if string.find(message, v) then
+				return
+			end
+		end
+		Log("Player Dropped: " .. tostring(message))
+
+		if Data.Session.Players[source] == nil then
+			return
+		end
+
+		table.insert(Data.Dropped, {
+			Identifier = Data.Session.Players[source].Identifier,
+			Grace = os.time() + (60 * 5),
+		})
+		QUEUE.Session:Remove(source)
+	end,
+	Remove = function(self, position)
+		table.remove(Data.Dropped, position)
+	end,
+}
+
+QUEUE.TempPriority = {
+	Get = function(self, identifier)
+		for _, v in ipairs(Data.TempPriority) do
+			if v.Identifier == identifier then
+				return v
+			end
+		end
+		return nil
+	end,
+	Add = function(self, identifier, prio)
+		QUEUE.TempPriority:Remove(identifier)
+		table.insert(Data.TempPriority, { Identifier = identifier, Priority = prio })
+	end,
+	Remove = function(self, identifier)
+		for k, v in ipairs(Data.TempPriority) do
+			if v.Identifier == identifier then
+				table.remove(Data.TempPriority, k)
+				return
+			end
+		end
+	end,
+}
+
+QUEUE.Session = {
+	Add = function(self, player)
+		Data.Session.Count = Data.Session.Count + 1
+		Data.Session.Players[player.Source] = player
+	end,
+	Remove = function(self, source)
+		Data.Session.Count = Data.Session.Count - 1
+		Data.Session.Players[source] = nil
+	end,
+}
+
+function GetPlayerSteam(source)
+	for _, id in ipairs(GetPlayerIdentifiers(source)) do
+		if string.sub(id, 1, string.len("steam:")) == "steam:" then
+			local steamHex = string.sub(id, string.len("steam:") + 1)
+			return steamHex
+		end
+	end
+	return false
 end
 
-exports('HandleConnection', function(source, identifier, deferrals)
-  if not IsSteamRunning(source) then
-    deferrals.done(Config.Strings.SteamRequired)
-    return CancelEvent()
-  end
+function GetPlayerSteamDecimal(source)
+	local steamHex = GetPlayerSteam(source)
+	if not steamHex then
+		return false
+	end
+	local steam64 = tonumber(steamHex, 16)
+	return tostring(steam64)
+end
 
-  local steamName = GetPlayerSteamName(source)
-  if not steamName then
-    deferrals.done(Config.Strings.SteamNameError)
-    return CancelEvent()
-  end
+function IsSteamRunning(source)
+	return GetPlayerSteam(source) ~= false
+end
 
-  if GlobalState.IsProduction then
-    while GetGameTimer() < (_dbReadyTime + (Config.Settings.QueueDelay * (1000 * 60))) do
-      local min = math.floor(
-        (
-          (math.floor(_dbReadyTime / 1000) + (Config.Settings.QueueDelay * 60))
-          - math.floor(GetGameTimer() / 1000)
-        ) / 60
-      )
-      local secs = math.floor(
-        (
-          (math.floor(_dbReadyTime / 1000) + (Config.Settings.QueueDelay * 60))
-          - math.floor(GetGameTimer() / 1000)
-        ) - (min * 60)
-      )
+function GetPlayerSteamName(source)
+	if GetPlayerSteam(source) then
+		local playerName = GetPlayerName(source)
+		if playerName and playerName ~= "Unknown" then
+			return playerName
+		end
+	end
+	return nil
+end
 
-      if min <= 0 then
-        deferrals.update(
-          string.format(Config.Strings.WaitingSeconds, secs, secs ~= 1 and "Seconds" or "Second")
-        )
-      else
-        deferrals.update(
-          string.format(
-            Config.Strings.Waiting,
-            min,
-            min ~= 1 and "Minutes" or "Minute",
-            secs,
-            secs ~= 1 and "Seconds" or "Second"
-          )
-        )
-      end
-      Wait(100)
-    end
-  end
+function ExtractIdentifiers(src)
+	local identifiers = {
+		steam = "",
+		ip = "",
+		discord = "",
+		license = "",
+		xbl = "",
+		live = "",
+	}
 
-  while not queueActive do
-    Wait(100)
-  end
+	--Loop over all identifiers
+	for i = 0, GetNumPlayerIdentifiers(src) - 1 do
+		local id = GetPlayerIdentifier(src, i)
 
-  PopFromQueue(identifier)
+		--Convert it to a nice table.
+		if string.find(id, "steam") then
+			identifiers.steam = id
+		elseif string.find(id, "ip") then
+			identifiers.ip = id
+		elseif string.find(id, "discord") then
+			identifiers.discord = id
+		elseif string.find(id, "license") then
+			identifiers.license = id
+		elseif string.find(id, "xbl") then
+			identifiers.xbl = id
+		elseif string.find(id, "live") then
+			identifiers.live = id
+		end
+	end
 
-  local ply = PlayerClass(identifier, source, deferrals, steamName)
+	return identifiers
+end
 
-  if not ply:IsWhitelisted() then
-    if APIWorking and WebAPI then
-      deferrals.presentCard(Config.Cards.NotWhitelisted, function(data, rawData)
-        if data and data.linking then
-          deferrals.presentCard(Config.Cards.AccountLinking, function(linkData, linkRawData)
-            if linkData and linkData.code and not linkData.cancel then
-              -- Attempt to link account
-              local success = WebAPI:LinkAccount(identifier, linkData.code)
-              if success then
-                deferrals.done(Config.Strings.WebLinkComplete)
-              else
-                deferrals.done(Config.Strings.WebLinkError)
-              end
-            else
-              deferrals.done(Config.Strings.NotWhitelisted)
-            end
-          end)
-        else
-          deferrals.done(Config.Strings.NotWhitelisted)
-        end
-      end)
-    else
-      deferrals.done(Config.Strings.NotWhitelisted)
-    end
-    return CancelEvent()
-  end
+QUEUE.Connect = function(self, source, playerName, setKickReason, deferrals)
+	local identifier = nil
 
-  local ban = exports['pulsar-core']:PunishmentCheckBan("identifier", identifier)
+	deferrals.defer()
+	Wait(1)
+	deferrals.update(Config.Strings.Init)
+	Wait(1000)
 
-  if not ban then
-    local connectingTokens = {}
-    do
-      local i = 0
-      while true do
-        local t = GetPlayerToken(source, i)
-        if not t then break end
-        table.insert(connectingTokens, t)
-        i = i + 1
-      end
-    end
-    ban = exports['pulsar-core']:PunishmentCheckBanTokens(connectingTokens)
-  end
+	CreateThread(function()
+		if not _dbReady or GlobalState.IsProduction == nil then
+			deferrals.done(Config.Strings.NotReady)
+			return CancelEvent()
+		end
 
-  if ban then
-    local reason = ban.reason or "Banned"
-    if ban.expires == -1 then
-      deferrals.done(string.format("You're Permanently Banned, Appeal in Discord\n\nReason: %s\nID: %s", reason, ban._id))
-    else
-      deferrals.done(string.format("You're Banned, Appeal in Discord\n\nReason: %s\nExpires: %s\nID: %s",
-        reason,
-        os.date("%%Y-%%m-%%d at %%I:%%M:%%S %%p", ban.expires),
-        ban._id
-      ))
-    end
-    return CancelEvent()
-  end
+		if queueClosed then
+			deferrals.done(Config.Strings.PendingRestart)
+			return CancelEvent()
+		end
 
-  local time = GetGameTimer()
-  local joinedAt = GetGameTimer()
-  local useSavedPos = false
-  if QUEUE_PLAYER_HISTORY[identifier] and QUEUE_PLAYER_HISTORY[identifier].expires > GetGameTimer() then
-    joinedAt = QUEUE_PLAYER_HISTORY[identifier].joinedAt
-    useSavedPos = true
-  end
+		if not IsSteamRunning(source) then
+			deferrals.done(Config.Strings.SteamRequired)
+			return CancelEvent()
+		end
 
-  QUEUE_PLAYERS_DATA[identifier] = ply
-  QUEUE_PLAYERS[identifier] = {
-    priority = ply:GetPriority(),
-    joinedAt = joinedAt,
-    time = time,
-  }
-  QUEUE_PLAYER_HISTORY[identifier] = {
-    joinedAt = joinedAt,
-    expires = GetGameTimer() + (Config.Settings.SavePosition * 60000),
-  }
+		local steamName = GetPlayerSteamName(source)
+		if not steamName then
+			deferrals.done(Config.Strings.SteamNameError)
+			return CancelEvent()
+		end
 
-  SortQueue()
-  Wait(1000)
+		-- Steam Web API key check
+		local steamWebApiKey = GetConvar("steam_webApiKey", "")
+		if not steamWebApiKey or steamWebApiKey == "" then
+			deferrals.done("Server Misconfiguration: Steam Web API Key is not set. Please contact the server owner.")
+			CancelEvent()
+			return
+		end
 
-  local pos, total = exports['pulsar-queue']:GetPosition(identifier)
-  Log(
-    string.format(
-      Config.Strings.Add,
-      ply.Name,
-      ply.SteamName or ply.AccountID,
-      ply.Identifier,
-      pos,
-      total,
-      GetNumPlayerIndices(),
-      ply.Priority
-    )
-  )
+		if GlobalState.IsProduction then
+			while GetGameTimer() < (_dbReadyTime + (Config.Settings.QueueDelay * (1000 * 60))) do
+				local min = math.floor(
+					(
+						(math.floor(_dbReadyTime / 1000) + (Config.Settings.QueueDelay * 60))
+						- math.floor(GetGameTimer() / 1000)
+					) / 60
+				)
+				local secs = math.floor(
+					(
+						(math.floor(_dbReadyTime / 1000) + (Config.Settings.QueueDelay * 60))
+						- math.floor(GetGameTimer() / 1000)
+					) - (min * 60)
+				)
 
-  while GetPlayerEndpoint(source) and not queueClosed and (
-      (not exports['pulsar-queue']:Check(identifier))
-      or (GetNumPlayerIndices() == MAX_PLAYERS)
-      or ((GetNumPlayerIndices() + CURRENT_CONNECTORS_COUNT + 1) > MAX_PLAYERS)
-      or ((GetNumPlayerIndices() + CURRENT_CONNECTORS_COUNT) >= MAX_PLAYERS)
-    ) do
-    ply.Timer:Tick()
-    local pos, total = exports['pulsar-queue']:GetPosition(identifier)
-    local msg = ""
-    if ply.Priority > 0 then
-      msg = "\n\nTotal Priority of " .. ply.Priority .. ": " .. ply.Message
-    end
+				if min <= 0 then
+					deferrals.update(
+						string.format(Config.Strings.WaitingSeconds, secs, secs > 1 and "Seconds" or "Second")
+					)
+				else
+					deferrals.update(
+						string.format(
+							Config.Strings.Waiting,
+							min,
+							min > 1 and "Minutes" or "Minute",
+							secs,
+							secs > 1 and "Seconds" or "Second"
+						)
+					)
+				end
 
-    if useSavedPos then
-      msg = msg .. "\n\n🥳 You Were Returned to Your Saved Queue Position"
-    end
+				Wait(100)
+			end
+		end
 
-    if pos == nil or total == nil then
-      print("Someone In Queue nil/nil ID:", ply.Identifier, "Data: ", identifier, pos, total,
-        json.encode(QUEUE_PLAYERS_DATA[identifier]), json.encode(QUEUE_PLAYERS[identifier]))
-    end
+		while not queueActive do
+			Wait(100)
+		end
 
-    ply.Deferrals.update(string.format(Config.Strings.Queued, pos, total, ply.Timer:Output(), msg))
+		local identifier = ExtractIdentifiers(source).license
 
-    if QUEUE_PLAYER_HISTORY[identifier] then
-      QUEUE_PLAYER_HISTORY[identifier].expires = GetGameTimer() + (Config.Settings.SavePosition * 60000)
-    end
+		if not identifier or identifier == "" then
+			deferrals.done(Config.Strings.NoIdentifier)
+			CancelEvent()
+			return
+		end
 
-    Wait(5000)
-  end
+		local ply = PlayerClass(identifier, source, deferrals)
 
-  -- Can join the server now :)
+		if not ply or not ply:IsWhitelisted() then
+			if not ply and not Config.Server.Access then
+				deferrals.done(Config.Strings.PublicWhitelist)
+			else
+				deferrals.done(Config.Strings.NotWhitelisted)
+			end
+			CancelEvent()
+			return
+		end
 
-  if queueClosed then
-    deferrals.done(Config.Strings.PendingRestart)
-    PopFromQueue(identifier, true)
-    return CancelEvent()
-  end
+		if not ply:IsVerified() then
+			deferrals.done(Config.Strings.NotVerified)
+			CancelEvent()
+			return
+		end
 
-  if GetPlayerEndpoint(source) then
-    CURRENT_CONNECTORS[identifier] = {
-      source = source
-    }
-    CURRENT_CONNECTORS_COUNT += 1
+		if GetPlayerName(source) == nil or ply.Name == nil or playerName == nil then
+			deferrals.done(
+				"You do not have a player name set for FiveM. Please set a Player Name then try reconnecting."
+			)
+			CancelEvent()
+			return
+		end
 
-    ply.Deferrals.update(Config.Strings.Joining)
-    ply.Deferrals.handover({ -- This is where window.nuiHandoverData is set for loading screen, should also be able to send character data through this
-      name = ply.Name,
-      priority = ply.Priority,
-      priorityMessage = ply.Message,
-    })
-    Wait(500)
-    ply.Deferrals.done()
+		-- if not ply:IsValid() then
+		-- 	deferrals.done(Config.Strings.NotValid)
+		-- 	CancelEvent()
+		-- 	return
+		-- end
 
-    Log(
-      string.format(
-        Config.Strings.Joined,
-        ply.Name,
-        ply.SteamName or ply.AccountID,
-        ply.Identifier
-      )
-    )
+		-- local siteBanned = ply:IsSiteBanned()
+		-- if siteBanned then
+		-- 	deferrals.done(Config.Strings.SiteBanned)
+		-- 	CancelEvent()
+		-- 	return
+		-- end
 
-    CONNECTING_PLAYERS_DATA[identifier] = ply
-    PopFromQueue(identifier)
-  else
-    if QUEUE_PLAYERS[identifier] and QUEUE_PLAYERS[identifier].time == time then
-      PopFromQueue(identifier, true)
-    end
-  end
-end)
+		local banned = ply:IsBanned()
+		-- (banned)
+		-- print(json.encode(banned))
+		if banned ~= nil then
+			if banned.issuer == "Pwnzor" then
+				banned.reason = "💙 From Pwnzor 🙂"
+			end
+			if banned.expires == -1 then
+				deferrals.done(string.format(Config.Strings.PermaBanned, banned.reason, banned._id or "N/A"))
+			else
+				deferrals.done(
+					string.format(
+						Config.Strings.Banned,
+						banned.reason,
+						os.date("%Y-%m-%d at %I:%M:%S %p", tostring(banned.expires)),
+						banned._id or "N/A"
+					)
+				)
+			end
+			CancelEvent()
+			return
+		end
 
-exports('Sort', function()
-  SortQueue()
-end)
+		local tknBan = ply:IsTokenBanned()
+		if tknBan ~= nil then
+			if tknBan.expires == -1 then
+				deferrals.done(string.format(Config.Strings.PermaBanned, tknBan.reason, tknBan._id or "N/A"))
+			else
+				deferrals.done(
+					string.format(
+						Config.Strings.Banned,
+						tknBan.reason,
+						os.date("%Y-%m-%d at %I:%M:%S %p", tostring(tknBan.expires)),
+						tknBan._id or "N/A"
+					)
+				)
+			end
+			CancelEvent()
+			return
+		end
 
-exports('Pop', function(identifier, disconnect)
-  PopFromQueue(identifier, disconnect)
-end)
+		-- if Data.Session.Count < MAX_PLAYERS then
+		--     self.Session:Add(ply)
+		--     deferrals.update(Config.Strings.Joining)
+		--     deferrals.done()
+		--     return
+		-- end
 
-exports('Check', function(identifier)
-  if QUEUE_PLAYERS_SORTED[1] == identifier then
-    return true
-  end
-  return false
-end)
+		QUEUE.Queue:Add(ply)
 
-exports('GetCount', function()
-  local count = 0
-  for k, v in pairs(QUEUE_PLAYERS) do
-    count += 1
-  end
-  return count
-end)
+		local pos, plyr = QUEUE.Queue:Get(identifier)
 
-exports('GetPosition', function(identifier)
-  local count = 0
-  local found = nil
-  for k, v in ipairs(QUEUE_PLAYERS_SORTED) do
-    count += 1
+		while plyr == nil do
+			QUEUE.Queue:Add(ply)
+			pos, plyr = QUEUE.Queue:Get(identifier)
+			Wait(100)
+		end
 
-    if v == identifier then
-      found = k
-    end
-  end
+		while plyr.State == States.QUEUED and GetPlayerEndpoint(source) do
+			pos, plyr = QUEUE.Queue:Get(identifier)
 
-  return found, count
-end)
+			local msg = ""
+			if plyr.Priority > 0 then
+				if plyr.TimeBoost > 0 then
+					msg = "\n\nTotal Priority of "
+						.. plyr.Priority
+						.. ": \n⏳ Time In Queue +"
+						.. plyr.TimeBoost
+						.. " ⏳"
+						.. plyr.Message
+				else
+					msg = "\n\nTotal Priority of " .. plyr.Priority .. ": " .. plyr.Message
+				end
+			end
+			if plyr.ReturnedFromSave then
+				msg = msg .. "\n\n🥳 You Were Returned to Your Saved Queue Position"
+			end
+			plyr.Deferrals.update(string.format(Config.Strings.Queued, pos, #Data.Queue, plyr.Timer:Output(), msg))
+			plyr.Timer:Tick(plyr)
+			Wait(1000)
+		end
 
-exports('CheckGhosts', function()
-  for k, v in pairs(CURRENT_CONNECTORS) do
-    if v and not GetPlayerEndpoint(v.source) then
-      CURRENT_CONNECTORS[k] = nil
-    end
-  end
+		pos, plyr = QUEUE.Queue:Get(identifier)
+		if plyr.State == States.QUEUED then
+			plyr.State = States.DISCONNECTED
+			plyr.Grace = (os.time() + (60 * 5))
+			--Log(string.format(Config.Strings.Grace, plyr.Name, os.date("%I:%M:%S %p", plyr.Grace)))
+			Data.Queue[pos] = plyr
+			--self.Queue:Remove(pos)
+		end
+	end)
+end
 
-  local count = 0
-  for k, v in pairs(CURRENT_CONNECTORS) do
-    if v then
-      count += 1
-    end
-  end
+QUEUE.Utils = {
+	CloseAndDrop = function(self)
+		queueClosed = true
+		for k, v in ipairs(Data.Queue) do
+			v.Deferrals.done(Config.Strings.PendingRestart)
+		end
+	end,
+}
 
-  CURRENT_CONNECTORS_COUNT = count
-end)
+QUEUE.GetTotal = function(self)
+	return #Data.Queue or 0
+end
 
-exports('AddCrashPriority', function(identifier, message)
-  -- for _, v in ipairs(Config.ExcludeDrop) do
-  -- 	if string.find(message, v) then
-  -- 		return
-  -- 	end
-  -- end
-
-  local ply = QUEUE_PLAYERS_DATA[identifier]
-  if ply then
-    Log(
-      string.format(
-        Config.Strings.Crash,
-        ply.Name,
-        ply.SteamName or ply.AccountID,
-        ply.Identifier
-      )
-    )
-  end
-
-  table.insert(QUEUE_CRASH_PRIORITY, {
-    Identifier = identifier,
-    Grace = os.time() + (60 * 20),
-  })
-end)
-
-exports('HasCrashPriority', function(identifier)
-  for k, v in ipairs(QUEUE_CRASH_PRIORITY) do
-    if v.Identifier == identifier and os.time() < v.Grace then
-      return true
-    end
-  end
-end)
-
-exports('AddTempPriority', function(identifier, prio)
-  exports['pulsar-queue']:RemoveTempPriority(identifier)
-
-  table.insert(QUEUE_TEMP_PRIORITY, {
-    Identifier = identifier,
-    Priority = prio,
-  })
-end)
-
-exports('RemoveTempPriority', function(identifier)
-  for k, v in ipairs(QUEUE_TEMP_PRIORITY) do
-    if v.Identifier == identifier then
-      table.remove(QUEUE_TEMP_PRIORITY, k)
-    end
-  end
-end)
-
-exports('HasTempPriority', function(identifier)
-  for k, v in ipairs(QUEUE_TEMP_PRIORITY) do
-    if v.Identifier == identifier then
-      return v
-    end
-  end
-end)
-
-exports('CloseAndDrop', function()
-  queueClosed = true
-
-  for k, v in pairs(QUEUE_PLAYERS) do
-    if QUEUE_PLAYERS_DATA[k] then
-      QUEUE_PLAYERS_DATA[k].Deferrals.done("Deleted")
-    end
-
-    PopFromQueue(k, true)
-  end
+CreateThread(function()
+	while true do
+		GlobalState["QueueCount"] = #Data.Queue
+		Wait(30000)
+	end
 end)
 
 AddEventHandler("playerConnecting", function(playerName, setKickReason, deferrals)
-  local _src = source
-
-  deferrals.defer()
-  Wait(1)
-  deferrals.update(Config.Strings.Init)
-
-  if not _dbReady or GlobalState.IsProduction == nil then
-    deferrals.done(Config.Strings.NotReady)
-    return CancelEvent()
-  end
-
-  if queueClosed then
-    deferrals.done(Config.Strings.PendingRestart)
-    return CancelEvent()
-  end
-
-  local identifier = GetPlayerLicense(_src)
-  if not identifier or identifier == "" then
-    deferrals.done(Config.Strings.NoIdentifier)
-    return CancelEvent()
-  end
-
-  exports['pulsar-queue']:HandleConnection(_src, identifier, deferrals)
+	if queueClosed then
+		deferrals.done(Config.Strings.PendingRestart)
+	elseif queueEnabled then
+		QUEUE:Connect(source, playerName, setKickReason, deferrals)
+	else
+		deferrals.done("Queue Closed, Try Again Later")
+	end
 end)
 
 AddEventHandler("playerDropped", function(message)
-  local src = source
+	if queueEnabled then
+		plsr.Queue.Dropped:Add(source, message)
+	end
+end)
 
-  local license = GetPlayerLicense(src)
-  if license then
-    if CURRENT_CONNECTORS[license] then
-      if CURRENT_CONNECTORS_COUNT >= 1 then
-        CURRENT_CONNECTORS_COUNT -= 1
-      end
+AddEventHandler("onResourceStart", function(resource)
+	if resource == "pulsar_core" then
+		while GetResourceState(resource) ~= "started" do
+			Wait(0)
+		end
+		for k, v in pairs(Data.Session.Players) do
+			TriggerClientEvent("Queue:Client:SessionActive", k)
+			TriggerEvent("Queue:Server:SessionActive", k, {
+				Groups = ply.Groups,
+				Name = ply.Name,
+				ID = ply.ID,
+				AccountID = ply.AccountID,
+				Avatar = ply.Avatar,
+				Identifier = ply.Identifier,
+				Tokens = ply.Tokens,
+			})
+		end
+	end
+end)
 
-      CURRENT_CONNECTORS[license] = nil
-    end
-
-    exports['pulsar-queue']:AddCrashPriority(license, message)
-    if QUEUE_PLAYERS[license] then
-      print("lol someone just got playerDropped while in queue somehow", license, message)
-    end
-    -- PopFromQueue(license, true)
-  end
+AddEventHandler("Core:Shared:Ready", function()
+	_dbReadyTime = GetGameTimer()
+	_dbReady = true
 end)
 
 RegisterServerEvent("Core:Server:SessionStarted")
 AddEventHandler("Core:Server:SessionStarted", function()
-  local src = source
-  local license = GetPlayerLicense(src)
-  if license then
-    if CURRENT_CONNECTORS[license] then
-      if CURRENT_CONNECTORS_COUNT >= 1 then
-        CURRENT_CONNECTORS_COUNT -= 1
-      end
+	local src = source
+	local identifier = ExtractIdentifiers(src).license
+	if identifier then
+		local pos, ply = plsr.Queue.Queue:Get(identifier)
 
-      -- print("Remove Joiner", CURRENT_CONNECTORS_COUNT)
+		if ply ~= nil then
+			ply.Source = src
+			ply.State = States.JOINED
+			QUEUE.Session:Add(ply)
+			QUEUE.Queue:Remove(pos)
+			TriggerClientEvent("Queue:Client:SessionActive", src)
+			TriggerEvent("Queue:Server:SessionActive", src, {
+				Groups = ply.Groups,
+				Name = ply.Name,
+				ID = ply.ID,
+				AccountID = ply.AccountID,
+				Avatar = ply.Avatar,
+				Identifier = ply.Identifier,
+				Tokens = ply.Tokens,
+			})
+			QUEUE.TempPriority:Remove(identifier)
+		end
 
-      CURRENT_CONNECTORS[license] = nil
-    end
+		return
+	end
 
-    local ply = CONNECTING_PLAYERS_DATA[license]
-    if ply then
-      TriggerClientEvent("Queue:Client:SessionActive", src)
-      TriggerEvent("Queue:Server:SessionActive", src, {
-        Groups = ply.Groups,
-        Name = ply.Name,
-        Discord = ply.Discord,
-        Mention = ply.Mention,
-        AccountID = ply.SteamName or ply.AccountID,
-        Avatar = ply.Avatar,
-        Identifier = ply.Identifier,
-        Tokens = ply.Tokens,
-      })
+	DropPlayer(src, Config.Strings.NoIdentifier)
+end)
 
-      CONNECTING_PLAYERS_DATA[license] = nil
-      exports['pulsar-queue']:RemoveTempPriority(license)
-      return
-    end
-  end
-
-  DropPlayer(src, Config.Strings.NoIdentifier)
+AddEventHandler("Proxy:Shared:RegisterReady", function()
+	exports["pulsar_core"]:RegisterComponent("Queue", QUEUE)
 end)
 
 CreateThread(function()
-  while not queueActive do
-    Wait(1000)
-  end
+	Config.Server = plsr.Config.Server
+	Config.Groups = plsr.Config.Groups
+	Config.GroupIDs = plsr.Config.GroupIDs
+	queueActive = true
 
-  if APIWorking and WebAPI then
-    queueEnabled = true
-    exports["pulsar-core"]:LoggerInfo("Queue", "Queue enabled with WebAPI support")
-  else
-    queueEnabled = true
-    exports["pulsar-core"]:LoggerInfo("Queue", "Queue enabled without WebAPI - account linking disabled")
-  end
+	plsr.Chat:RegisterAdminCommand("clearjoining", function(source, args, rawCommand)
+		playerJoining = false
+		privPlayerJoining = false
+	end, {
+		help = "Clear Queue Joining State",
+	}, 0)
 
-  while GetResourceState("hardcap") ~= "stopped" do
-    local state = GetResourceState("hardcap")
-    if state == "missing" then
-      break
-    end
+	plsr.Chat:RegisterAdminCommand("queue", function(source, args, rawCommand)
+		local message = "Queue List"
+		for k, v in ipairs(Data.Queue) do
+			message = message .. string.format("\n#%d - %s (%s)", k, v.Name, v.Identifier)
+		end
+		plsr.Execute:Client(source, "Notification", "Info", message)
+	end, {
+		help = "Print the Queue",
+	}, 0)
 
-    if state == "started" then
-      StopResource("hardcap")
-      break
-    end
+	plsr.Chat:RegisterAdminCommand("yeetqueue", function(source, args, rawCommand)
+		for k, v in ipairs(Data.Queue) do
+			v.Deferrals.done("Deleted")
+		end
+		Data.Queue = {}
+		plsr.Execute:Client(source, "Notification", "Success", "Done")
+	end, {
+		help = "Yeet the Queue [DANGER!]",
+	}, 0)
 
-    Wait(5000)
-  end
+	plsr.Chat:RegisterAdminCommand("maxplayers", function(source, args, rawCommand)
+		local max = tonumber(args[1])
+		if max and max > 0 and max < 500 then
+			MAX_PLAYERS = max
+			GlobalState["MaxPlayers"] = MAX_PLAYERS
+			SetConvarServerInfo("sv_maxclients", MAX_PLAYERS)
+			plsr.Execute:Client(source, "Notification", "Success", "Max Players Set")
+		end
+	end, {
+		help = "Set Max Players",
+		params = {
+			{
+				name = "Max Player Count",
+				help = "Number",
+			},
+		},
+	}, 1)
 
-  Wait(10000)
+	plsr.Chat:RegisterStaffCommand("tempprio", function(source, args, rawCommand)
+		local ident = args[1]
+		local prio = tonumber(args[2])
+
+		if ident and prio and prio > 0 and prio <= 200 then
+			QUEUE.TempPriority:Add(ident, prio)
+			plsr.Execute:Client(source, "Notification", "Success", "Priority Added")
+		else
+			plsr.Execute:Client(source, "Notification", "Error", "Error")
+		end
+	end, {
+		help = "Add Temporary Priority",
+		params = {
+			{
+				name = "Player Identifier",
+				help = "Player's FiveM Identifier (License)",
+			},
+			{
+				name = "Priority",
+				help = "Number (1-200)",
+			},
+		},
+	}, 2)
+
+	plsr.Chat:RegisterAdminCommand("tempwl", function(source, args, rawCommand)
+		local accountID = args[1]
+		if accountID then
+			if not _tempWhitelist[accountID] then
+				_tempWhitelist[accountID] = true
+				plsr.Execute:Client(source, "Notification", "Success", "Temp Whitelist Added For ID: " .. accountID)
+			else
+				_tempWhitelist[accountID] = false
+				plsr.Execute:Client(source, "Notification", "Error", "Temp Whitelist Revoked For ID: " .. accountID)
+			end
+		end
+	end, {
+		help = "Temp Whitelist Someone",
+		params = {
+			{
+				name = "Account DB ID",
+				help = "Account DB Number - Look at URL",
+			},
+		},
+	}, 1)
+
+	plsr.Chat:RegisterAdminCommand("tempwlgroup", function(source, args, rawCommand)
+		local group = args[1]
+		if group then
+			if not _tempWhitelistGroup[group] then
+				_tempWhitelistGroup[group] = true
+				plsr.Execute:Client(source, "Notification", "Success", "Temp Whitelist Added For Group: " .. group)
+			else
+				_tempWhitelistGroup[group] = false
+				plsr.Execute:Client(source, "Notification", "Error", "Temp Whitelist Revoked For Group: " .. group)
+			end
+		end
+	end, {
+		help = "Temp Whitelist a Group",
+		params = {
+			{
+				name = "Group Abbreviation",
+				help = "Group Abbreviation",
+			},
+		},
+	}, 1)
+end)
+
+function Log(log, flagsOverride)
+	local flags = { console = true }
+	if flagsOverride ~= nil then
+		flags = flagsOverride
+	end
+	TriggerEvent("Logger:Info", "Queue", log, flags)
+end
+
+CreateThread(function()
+	while not queueActive do
+		Wait(1000)
+	end
+
+	if not plsr.WebAPI.Enabled then
+		Log("^8Queue Disabled^7", { console = true })
+		queueEnabled = false
+		return
+	end
+
+	while GetResourceState("hardcap") ~= "stopped" do
+		local state = GetResourceState("hardcap")
+		if state == "missing" then
+			break
+		end
+
+		if state == "started" then
+			StopResource("hardcap")
+			break
+		end
+
+		Wait(5000)
+	end
+
+	Wait(10000)
+
+	while queueEnabled do
+		if GetNumPlayerIndices() < MAX_PLAYERS and #Data.Queue > 0 and not (playerJoining or privPlayerJoining) then
+			playerJoining = true
+			QUEUE.Queue:Join(MAX_PLAYERS - GetNumPlayerIndices())
+		end
+
+		Wait(1000)
+	end
 end)
 
 CreateThread(function()
-  while true do
-    GlobalState["QueueCount"] = exports['pulsar-queue']:GetCount()
-
-    exports['pulsar-queue']:CheckGhosts()
-
-    Wait(20000)
-  end
+	while queueEnabled do
+		for k, v in ipairs(Data.Queue) do
+			if v.State == States.DISCONNECTED and not v:IsInGracePeriod() then
+				QUEUE.Queue:Remove(k)
+			end
+		end
+		Wait(10000)
+	end
 end)
-
-RegisterCommand("print_connect_count", function()
-  print("CC", CURRENT_CONNECTORS_COUNT)
-end, true)
-
-RegisterCommand("print_queue", function()
-  print("CC", json.encode(QUEUE_PLAYERS, { indent = true }))
-end, true)
