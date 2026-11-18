@@ -257,13 +257,87 @@ function IsSteamRunning(source)
 	return GetPlayerSteam(source) ~= false
 end
 
-function GetPlayerSteamName(source)
-	if GetPlayerSteam(source) then
-		local playerName = GetPlayerName(source)
-		if playerName and playerName ~= "Unknown" then
-			return playerName
+local _steamNameCache = {}
+
+local function fetchSteamPersonaName(steamId, apiKey)
+	local p = promise.new()
+	local settled = false
+
+	local function finish(name)
+		if settled then
+			return
 		end
+		settled = true
+		p:resolve(name)
 	end
+
+	local function fromProfileXml()
+		PerformHttpRequest(
+			("https://steamcommunity.com/profiles/%s/?xml=1"):format(steamId),
+			function(status, body)
+				if status == 200 and body then
+					local name = body:match("<steamID><!%[CDATA%[([^%]]*)%]%]></steamID>")
+					if name and name ~= "" then
+						return finish(name)
+					end
+				end
+				finish(nil)
+			end,
+			"GET"
+		)
+	end
+
+	if apiKey and apiKey ~= "" then
+		PerformHttpRequest(
+			("https://api.steampowered.com/ISteamUser/GetPlayerSummaries/v2/?key=%s&steamids=%s"):format(
+				apiKey,
+				steamId
+			),
+			function(status, body)
+				if status == 200 and body then
+					local ok, data = pcall(json.decode, body)
+					local players = ok and data and data.response and data.response.players
+					if players and players[1] and players[1].personaname and players[1].personaname ~= "" then
+						return finish(players[1].personaname)
+					end
+				end
+				fromProfileXml()
+			end,
+			"GET"
+		)
+	else
+		fromProfileXml()
+	end
+
+	SetTimeout(5000, function()
+		finish(nil)
+	end)
+
+	return Citizen.Await(p)
+end
+
+function GetPlayerSteamName(source)
+	local steamHex = GetPlayerSteam(source)
+	if not steamHex then
+		return nil
+	end
+
+	if _steamNameCache[steamHex] then
+		return _steamNameCache[steamHex]
+	end
+
+	local steamId = GetPlayerSteamDecimal(source)
+	local name = steamId and fetchSteamPersonaName(steamId, GetConvar("steam_webApiKey", "")) or nil
+
+	if not name or name == "" or name == "Unknown" then
+		name = GetPlayerName(source)
+	end
+
+	if name and name ~= "" and name ~= "Unknown" then
+		_steamNameCache[steamHex] = name
+		return name
+	end
+
 	return nil
 end
 
@@ -386,6 +460,10 @@ QUEUE.Connect = function(self, source, playerName, setKickReason, deferrals)
 		end
 
 		local ply = PlayerClass(identifier, source, deferrals)
+
+		if ply ~= nil and steamName then
+			ply.Name = steamName
+		end
 
 		if not ply or not ply:IsWhitelisted() then
 			if not ply and not Config.Server.Access then
